@@ -8,6 +8,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -77,13 +78,32 @@ TOOLS = [
     },
     {
         "name": "diary_list",
-        "description": "查询指定日期或日期范围内的时光序日程列表，默认查询今天。",
+        "description": (
+            "查询时光序日程列表。三种模式：\n"
+            "1. 不传任何参数 → 查询全部日程（自动分页拉取所有）\n"
+            "2. 传 date → 查询指定单日\n"
+            "3. 传 start_date + end_date → 查询日期范围（上限 31 天）"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "date": {"type": "string", "description": "可选日期，格式 YYYY-MM-DD；默认今天"},
+                "date": {"type": "string", "description": "可选日期，格式 YYYY-MM-DD；查询单日"},
                 "start_date": {"type": "string", "description": "可选开始日期，格式 YYYY-MM-DD"},
                 "end_date": {"type": "string", "description": "可选结束日期，格式 YYYY-MM-DD"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memo_list",
+        "description": "查询时光序备忘录列表，返回所有备忘录或按分类筛选。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "folder_id": {"type": "string", "description": "可选，按备忘录分类 ID 筛选"},
+                "keyword": {"type": "string", "description": "可选，按关键词搜索备忘录"},
+                "page": {"type": "integer", "description": "可选，页码，默认 1"},
+                "page_size": {"type": "integer", "description": "可选，每页条数，默认 50"},
             },
             "additionalProperties": False,
         },
@@ -333,18 +353,84 @@ class ShiguangxuClient:
         except ValueError as exc:
             raise ValueError(f"{name} 格式无效，请使用 YYYY-MM-DD") from exc
 
+    def _is_empty(self, value: Any) -> bool:
+        """判断参数是否为空（None 或空字符串）。"""
+        return value is None or (isinstance(value, str) and not value.strip())
+
+    def _list_all_diaries(self) -> dict[str, Any]:
+        """全量查询：循环分页拉取所有日程，返回精简列表。"""
+        MAX_PAGES = 100  # 安全上限，防止无限循环（最多 20000 条）
+        # recordview 接口要求 theDateTime 必填（否则 601 validate.theDay.notnull），
+        # 但该字段不影响返回范围——无论传什么日期，接口都返回全量日程。
+        the_date_time = datetime.now().strftime("%Y%m%d120000")
+        found: dict[str, dict[str, Any]] = {}
+        page = 1
+        while page <= MAX_PAGES:
+            result = self._request(
+                "/base/plan/record/recordview",
+                {
+                    "currentPage": page,
+                    "pageSize": 200,
+                    "isAllInfo": False,
+                    "keyword": "",
+                    "offset": 0,
+                    "theDateTime": the_date_time,
+                },
+            )
+            rows = (result.get("data") or {}).get("rows") or []
+            if not isinstance(rows, list):
+                raise ShiguangxuError("日程列表响应中缺少 data.rows")
+            if not rows:
+                break
+            for item in rows:
+                if not isinstance(item, dict) or item.get("todoType") != 1:
+                    continue
+                item_id = str(item.get("id") or "")
+                if not item_id:
+                    continue
+                found[item_id] = item
+            if len(rows) < 200:
+                break
+            page += 1
+
+        items = []
+        for item in sorted(found.values(), key=lambda row: (str(row.get("todoTime") or ""), str(row.get("id") or ""))):
+            raw_time = str(item.get("todoTime") or "")
+            if len(raw_time) >= 8:
+                display_date = datetime.strptime(raw_time[:8], "%Y%m%d").strftime("%Y-%m-%d")
+            else:
+                display_date = raw_time
+            items.append(
+                {
+                    "id": str(item.get("id") or ""),
+                    "title": item.get("shortTitle") or item.get("title") or "",
+                    "date": display_date,
+                    "status": "已完成" if item.get("finishState") == 1 else "未完成",
+                }
+            )
+        return {
+            "mode": "all",
+            "count": len(items),
+            "items": items,
+        }
+
     def list_diaries(
         self,
         date_value: Any = None,
         start_date: Any = None,
         end_date: Any = None,
     ) -> dict[str, Any]:
-        if date_value is not None and (start_date is not None or end_date is not None):
+        # ── 全部参数为空 → 查询全部日程 ──
+        if self._is_empty(date_value) and self._is_empty(start_date) and self._is_empty(end_date):
+            return self._list_all_diaries()
+
+        # ── 有日期参数 → 走原有日期/范围查询 ──
+        if not self._is_empty(date_value) and (not self._is_empty(start_date) or not self._is_empty(end_date)):
             raise ValueError("date 不能与 start_date/end_date 同时使用")
-        if date_value is not None:
+        if not self._is_empty(date_value):
             first = last = self._parse_date(date_value, "date")
-        elif start_date is not None or end_date is not None:
-            if start_date is None or end_date is None:
+        elif not self._is_empty(start_date) or not self._is_empty(end_date):
+            if self._is_empty(start_date) or self._is_empty(end_date):
                 raise ValueError("start_date 和 end_date 必须同时提供")
             first = self._parse_date(start_date, "start_date")
             last = self._parse_date(end_date, "end_date")
@@ -417,6 +503,62 @@ class ShiguangxuClient:
             "items": items,
         }
 
+    def list_memos(
+        self,
+        folder_id: Any = None,
+        keyword: Any = None,
+        page: Any = None,
+        page_size: Any = None,
+    ) -> dict[str, Any]:
+        if folder_id is not None and not isinstance(folder_id, str):
+            raise ValueError("folder_id 必须是字符串")
+        if keyword is not None and not isinstance(keyword, str):
+            raise ValueError("keyword 必须是字符串")
+        current_page = int(page) if page is not None else 1
+        size = int(page_size) if page_size is not None else 50
+        if current_page < 1:
+            raise ValueError("page 必须 >= 1")
+        if size < 1 or size > 200:
+            raise ValueError("page_size 必须在 1-200 之间")
+
+        payload: dict[str, Any] = {"currentPage": current_page, "pageSize": size}
+        if folder_id:
+            payload["folderId"] = folder_id.strip()
+        if keyword and keyword.strip():
+            payload["keyword"] = keyword.strip()
+
+        result = self._request("/base/summary/v2/list", payload)
+        rows = (result.get("data") or {}).get("rows") or []
+        if not isinstance(rows, list):
+            raise ShiguangxuError("备忘录列表响应中缺少 data.rows")
+
+        tag_re = re.compile(r"<[^>]+>")
+
+        items = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            raw_time = str(row.get("lastEditDate") or row.get("created") or "")
+            if len(raw_time) >= 14:
+                update_time = datetime.strptime(raw_time[:14], "%Y%m%d%H%M%S").strftime("%Y-%m-%d %H:%M")
+            elif len(raw_time) >= 8:
+                update_time = datetime.strptime(raw_time[:8], "%Y%m%d").strftime("%Y-%m-%d")
+            else:
+                update_time = raw_time
+            title = tag_re.sub("", str(row.get("title") or ""))
+            content = tag_re.sub("", str(row.get("content") or ""))
+            items.append({
+                "id": str(row.get("id") or ""),
+                "title": title,
+                "content": content[:200],
+                "update_time": update_time,
+            })
+        return {
+            "page": current_page,
+            "page_size": size,
+            "count": len(items),
+            "items": items,
+        }
 
 
 # ── 模块级 Client 单例，避免每次 tools/call 重建 ──
@@ -473,6 +615,13 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
             elif name == "diary_list":
                 value = client.list_diaries(
                     arguments.get("date"), arguments.get("start_date"), arguments.get("end_date")
+                )
+            elif name == "memo_list":
+                value = client.list_memos(
+                    arguments.get("folder_id"),
+                    arguments.get("keyword"),
+                    arguments.get("page"),
+                    arguments.get("page_size"),
                 )
             else:
                 raise KeyError(f"未知工具：{name}")
