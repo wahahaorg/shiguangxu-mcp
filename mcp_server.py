@@ -108,6 +108,44 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "todo_add",
+        "description": "在时光序中创建一条清单事项（无日期的待办，todoType=3）。与日程不同，清单事项没有时间节点。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "清单事项标题，如'洗床单被罩'"},
+                "remark": {"type": "string", "description": "可选备注"},
+                "classify_id": {"type": "string", "description": "可选，日程分类 ID；不传则使用默认分类"},
+            },
+            "required": ["title"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "todo_list",
+        "description": "查询时光序清单事项列表（无日期的待办，todoType=3），返回所有清单事项。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_completed": {
+                    "type": "boolean",
+                    "description": "可选，是否包含已完成事项，默认 true",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "todo_complete",
+        "description": "按 ID 将一条清单事项（todoType=3）标记为完成。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": ["string", "integer"], "description": "清单事项 ID"}},
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -560,6 +598,101 @@ class ShiguangxuClient:
             "items": items,
         }
 
+    # ── 清单事项（todoType=3，无日期待办）──
+
+    def todo_add(self, title: Any, remark: Any = "", classify_id: Any = None) -> dict[str, Any]:
+        """创建一条清单事项（todoType=3，无日期）。"""
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError("title 必须是非空字符串")
+        if not isinstance(remark, str):
+            raise ValueError("remark 必须是字符串")
+        cid = str(classify_id).strip() if classify_id else self._classify_id()
+        record = {
+            "localId": 1,
+            "todoType": 3,
+            "importance": 2,
+            "shortTitle": title.strip(),
+            "title": title.strip(),
+            "attachments": [],
+            "todoClassifyId": cid,
+            "address": "",
+            "remark": remark,
+            "longitude": "",
+            "latitude": "",
+            "sonDeleteList": [],
+            "sonAddList": [],
+            "sonUpdateList": [],
+            "aheadType": [{"offset": 0}],
+            "intervalType": 1,
+        }
+        return self._request("/base/plan/record/add", record)
+
+    def list_todos(self, include_completed: Any = True) -> dict[str, Any]:
+        """全量分页查询清单事项（todoType=3），返回精简列表。"""
+        MAX_PAGES = 100
+        the_date_time = datetime.now().strftime("%Y%m%d120000")
+        found: dict[str, dict[str, Any]] = {}
+        page = 1
+        while page <= MAX_PAGES:
+            result = self._request(
+                "/base/plan/record/recordview",
+                {
+                    "currentPage": page,
+                    "pageSize": 200,
+                    "isAllInfo": False,
+                    "keyword": "",
+                    "offset": 0,
+                    "theDateTime": the_date_time,
+                },
+            )
+            rows = (result.get("data") or {}).get("rows") or []
+            if not isinstance(rows, list):
+                raise ShiguangxuError("清单列表响应中缺少 data.rows")
+            if not rows:
+                break
+            for item in rows:
+                if not isinstance(item, dict) or item.get("todoType") != 3:
+                    continue
+                item_id = str(item.get("id") or "")
+                if not item_id:
+                    continue
+                found[item_id] = item
+            if len(rows) < 200:
+                break
+            page += 1
+
+        items = []
+        for item in sorted(found.values(), key=lambda row: str(row.get("id") or "")):
+            finished = item.get("finishState") == 1
+            if not include_completed and finished:
+                continue
+            items.append(
+                {
+                    "id": str(item.get("id") or ""),
+                    "title": item.get("shortTitle") or item.get("title") or "",
+                    "status": "已完成" if finished else "未完成",
+                    "classify_id": str(item.get("todoClassifyId") or ""),
+                }
+            )
+        return {
+            "count": len(items),
+            "items": items,
+        }
+
+    def todo_complete(self, item_id: Any) -> dict[str, Any]:
+        """将一条清单事项（todoType=3）标记为完成。
+
+        清单事项使用独立的 checklist 接口，参数为 checklistId（非 todoId），
+        且不需要 todoTime。这与日程 checkin（/base/plan/checkin）不同。
+        """
+        if isinstance(item_id, bool) or not isinstance(item_id, (str, int)) or not str(item_id).strip():
+            raise ValueError("id 必须是非空字符串或整数")
+        item_id = str(item_id)
+        return self._request(
+            "/base/plan/checklist/checkin/all",
+            {"finishState": 1, "checklistId": item_id},
+        )
+
 
 # ── 模块级 Client 单例，避免每次 tools/call 重建 ──
 _client: ShiguangxuClient | None = None
@@ -623,6 +756,17 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
                     arguments.get("page"),
                     arguments.get("page_size"),
                 )
+            elif name == "todo_add":
+                value = client.todo_add(
+                    arguments.get("title"),
+                    arguments.get("remark", ""),
+                    arguments.get("classify_id"),
+                )
+            elif name == "todo_list":
+                include = arguments.get("include_completed", True)
+                value = client.list_todos(include)
+            elif name == "todo_complete":
+                value = client.todo_complete(arguments.get("id"))
             else:
                 raise KeyError(f"未知工具：{name}")
             result = _tool_result(value)
