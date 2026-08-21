@@ -146,6 +146,22 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "todo_delete",
+        "description": "按 ID 删除一条或多条清单事项（todoType=3）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ids": {
+                    "type": "array",
+                    "items": {"type": ["string", "integer"]},
+                    "description": "要删除的清单事项 ID 列表",
+                },
+            },
+            "required": ["ids"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -693,6 +709,21 @@ class ShiguangxuClient:
             {"finishState": 1, "checklistId": item_id},
         )
 
+    def todo_delete(self, ids: Any) -> dict[str, Any]:
+        """删除一条或多条清单事项（todoType=3）。
+
+        清单事项使用独立的 checklist 删除接口 /base/plan/checklist/delete，
+        参数为 {ids: [id1, id2, ...]}。这与日程删除（/base/plan/delete）不同。
+        """
+        if not isinstance(ids, list) or not ids:
+            raise ValueError("ids 必须是非空数组")
+        str_ids = []
+        for item_id in ids:
+            if isinstance(item_id, bool) or not isinstance(item_id, (str, int)) or not str(item_id).strip():
+                raise ValueError(f"ids 中的每个元素必须是非空字符串或整数，收到：{item_id!r}")
+            str_ids.append(str(item_id))
+        return self._request("/base/plan/checklist/delete", {"ids": str_ids})
+
 
 # ── 模块级 Client 单例，避免每次 tools/call 重建 ──
 _client: ShiguangxuClient | None = None
@@ -767,6 +798,8 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
                 value = client.list_todos(include)
             elif name == "todo_complete":
                 value = client.todo_complete(arguments.get("id"))
+            elif name == "todo_delete":
+                value = client.todo_delete(arguments.get("ids"))
             else:
                 raise KeyError(f"未知工具：{name}")
             result = _tool_result(value)
