@@ -162,6 +162,54 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "focus_list",
+        "description": "查询时光序「番茄专注」模块的专注任务列表（含专注时长/休息时长/番茄个数配置）。",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "focus_record_add",
+        "description": (
+            "向时光序「番茄专注」写入一条已完成的专注记录（原生专注记录，与 App/网页端一致）。"
+            "默认写入第一个番茄钟类型的任务，默认结束时间为现在、开始时间 = 结束时间 - minutes。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "minutes": {"type": "number", "description": "专注时长（分钟），>=1"},
+                "task_id": {"type": ["string", "integer"], "description": "可选，专注任务 ID；不传则自动选第一个番茄钟任务"},
+                "start": {"type": "string", "description": "可选开始时间，如 2026-09-06 15:00；默认结束时间往前推 minutes"},
+                "end": {"type": "string", "description": "可选结束时间，默认现在"},
+                "remark": {"type": "string", "description": "可选备注"},
+            },
+            "required": ["minutes"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "focus_records",
+        "description": "查询时光序专注记录（可查今天/单日/日期范围，上限 31 天），返回每条时长与合计分钟数。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "可选日期，格式 YYYY-MM-DD；默认今天"},
+                "start_date": {"type": "string", "description": "可选开始日期 YYYY-MM-DD"},
+                "end_date": {"type": "string", "description": "可选结束日期 YYYY-MM-DD"},
+                "page_size": {"type": "integer", "description": "可选，返回条数上限，默认 50"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "focus_delete",
+        "description": "按 ID 删除一条专注记录。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": ["string", "integer"], "description": "专注记录 ID"}},
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -724,6 +772,203 @@ class ShiguangxuClient:
             str_ids.append(str(item_id))
         return self._request("/base/plan/checklist/delete", {"ids": str_ids})
 
+    # ── 番茄专注（/base/focus/*，与 Web 端「番茄专注」模块一致）──
+
+    def focus_list(self) -> dict[str, Any]:
+        """查询专注任务列表，合并进行中与已归档。"""
+        result = self._request("/base/focus/v3/repeat/list", {})
+        data = result.get("data") or {}
+        type_names = {1: "倒计时", 2: "正计时", 3: "番茄钟"}
+        tasks = []
+        for key, state in (("unFinishList", "进行中"), ("finishList", "已归档")):
+            for item in data.get(key) or []:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                config = item.get("repeatConfig") or {}
+                focus_type = item.get("focusType")
+                tasks.append(
+                    {
+                        "id": str(item["id"]),
+                        "title": item.get("title") or "",
+                        "type": type_names.get(focus_type, "未知"),
+                        "focus_minutes": config.get("time"),
+                        "rest_minutes": config.get("restTime"),
+                        "tomato_num": config.get("focusNum"),
+                        "state": state,
+                    }
+                )
+        return {"count": len(tasks), "tasks": tasks}
+
+    def _focus_task(self, task_id: Any) -> dict[str, Any]:
+        """取专注任务：指定 ID 精确匹配；未指定则选第一个番茄钟类型任务。"""
+        result = self._request("/base/focus/v3/repeat/list", {})
+        data = result.get("data") or {}
+        candidates = list(data.get("unFinishList") or []) + list(data.get("finishList") or [])
+        wanted = str(task_id).strip() if task_id else ""
+        for item in candidates:
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            if wanted:
+                if str(item["id"]) == wanted:
+                    return item
+            elif item.get("focusType") == 3:
+                return item
+        if wanted:
+            raise ShiguangxuError(f"专注任务不存在：{wanted}")
+        if candidates:
+            return candidates[0]
+        raise ShiguangxuError("账号没有专注任务，请先在时光序「番茄专注」中创建一个")
+
+    def focus_record_add(
+        self,
+        minutes: Any,
+        task_id: Any = None,
+        start: Any = None,
+        end: Any = None,
+        remark: Any = "",
+    ) -> dict[str, Any]:
+        """写入一条已完成的专注记录。
+
+        请求体逆向自 web.shiguangxu.com 前端 completeFocus()：
+        eventList 记录事件流（5=开始番茄钟, 3=完成番茄钟），时间格式 yyyyMMddHHmmss。
+        """
+        if isinstance(minutes, bool) or not isinstance(minutes, (int, float)) or minutes < 1:
+            raise ValueError("minutes 必须是 >=1 的数字（分钟）")
+        minutes = int(minutes)
+        if not isinstance(remark, str):
+            raise ValueError("remark 必须是字符串")
+        if not self._is_empty(end):
+            end_dt = datetime.strptime(self._format_datetime(end), "%Y%m%d%H%M%S")
+        else:
+            end_dt = datetime.now()
+        if self._is_empty(start):
+            start_dt = end_dt - timedelta(minutes=minutes)
+        else:
+            start_dt = datetime.strptime(self._format_datetime(start), "%Y%m%d%H%M%S")
+        if start_dt > end_dt:
+            raise ValueError("start 不能晚于 end")
+
+        task = self._focus_task(task_id)
+        config = task.get("repeatConfig") or {}
+        focus_type = int(task.get("focusType") or 1)
+        full_time = int(config.get("time") or minutes)
+        focus_num = int(config.get("focusNum") or 0)
+        title = str(task.get("title") or "专注")
+
+        start_event = {
+            "eventType": 5,
+            "focusMinute": 0,
+            "content": "开始: 第1个番茄钟",
+            "eventTime": start_dt.strftime("%Y%m%d%H%M%S"),
+            "startTime": start_dt.strftime("%H:%M"),
+            "surplusTime": full_time * 60,
+            "residueCount": full_time * 60,
+            "focusNum": focus_num,
+            "allFocusTime": 0,
+        }
+        finish_event = {
+            "eventType": 3,
+            "focusMinute": minutes,
+            "content": "完成番茄钟",
+            "eventTime": end_dt.strftime("%Y%m%d%H%M%S"),
+            "startTime": end_dt.strftime("%H:%M"),
+            "surplusTime": 0,
+            "residueCount": 0,
+            "focusNum": focus_num,
+            "allFocusTime": minutes * 60,
+        }
+        record = {
+            "eventList": [start_event, finish_event],
+            "focusType": focus_type,
+            "repeatId": str(task["id"]),
+            "useTime": minutes,
+            "startTime": start_dt.strftime("%Y%m%d%H%M%S"),
+            "endTime": end_dt.strftime("%Y%m%d%H%M%S"),
+            "fullTime": full_time,
+            "title": title,
+            "remark": remark,
+            "focusNum": focus_num,
+        }
+        return self._request("/base/focus/v3/repeat/addFocusRecord", record)
+
+    def focus_records(
+        self,
+        date_value: Any = None,
+        start_date: Any = None,
+        end_date: Any = None,
+        page_size: Any = 50,
+    ) -> dict[str, Any]:
+        """查询专注记录。统计接口要求日期格式 yyyyMMdd 且 type=DAY。"""
+        if not self._is_empty(date_value) and (not self._is_empty(start_date) or not self._is_empty(end_date)):
+            raise ValueError("date 不能与 start_date/end_date 同时使用")
+        if not self._is_empty(date_value):
+            first = last = self._parse_date(date_value, "date")
+        elif not self._is_empty(start_date) or not self._is_empty(end_date):
+            if self._is_empty(start_date) or self._is_empty(end_date):
+                raise ValueError("start_date 和 end_date 必须同时提供")
+            first = self._parse_date(start_date, "start_date")
+            last = self._parse_date(end_date, "end_date")
+        else:
+            first = last = datetime.now().date()
+        if first > last:
+            raise ValueError("start_date 不能晚于 end_date")
+        if (last - first).days >= MAX_QUERY_DAYS:
+            last = first + timedelta(days=MAX_QUERY_DAYS - 1)
+        try:
+            size = int(page_size) if page_size is not None else 50
+        except (TypeError, ValueError) as exc:
+            raise ValueError("page_size 必须是整数") from exc
+        size = min(max(size, 1), 200)
+
+        result = self._request(
+            "/base/focus/v3/statistic/recordList",
+            {
+                "pageNum": 1,
+                "pageSize": size,
+                "beginDate": first.strftime("%Y%m%d"),
+                "endDate": last.strftime("%Y%m%d"),
+                "type": "DAY",
+            },
+        )
+        rows = (result.get("data") or {}).get("rows") or []
+        items = []
+        total_minutes = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            minutes = row.get("useTime") or 0
+            if isinstance(minutes, (int, float)):
+                total_minutes += int(minutes)
+            start_raw = str(row.get("startTime") or "")
+            end_raw = str(row.get("endTime") or "")
+
+            def _fmt(raw: str) -> str:
+                return datetime.strptime(raw[:14], "%Y%m%d%H%M%S").strftime("%Y-%m-%d %H:%M") if len(raw) >= 14 else raw
+
+            items.append(
+                {
+                    "id": str(row.get("id") or ""),
+                    "title": row.get("title") or "",
+                    "minutes": minutes,
+                    "start": _fmt(start_raw),
+                    "end": _fmt(end_raw),
+                    "remark": row.get("remark") or "",
+                }
+            )
+        return {
+            "start_date": first.isoformat(),
+            "end_date": last.isoformat(),
+            "count": len(items),
+            "total_minutes": total_minutes,
+            "items": items,
+        }
+
+    def focus_delete(self, item_id: Any) -> dict[str, Any]:
+        """按 ID 删除一条专注记录。"""
+        if isinstance(item_id, bool) or not isinstance(item_id, (str, int)) or not str(item_id).strip():
+            raise ValueError("id 必须是非空字符串或整数")
+        return self._request("/base/focus/del", {"id": str(item_id)})
+
 
 # ── 模块级 Client 单例，避免每次 tools/call 重建 ──
 _client: ShiguangxuClient | None = None
@@ -800,6 +1045,25 @@ def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
                 value = client.todo_complete(arguments.get("id"))
             elif name == "todo_delete":
                 value = client.todo_delete(arguments.get("ids"))
+            elif name == "focus_list":
+                value = client.focus_list()
+            elif name == "focus_record_add":
+                value = client.focus_record_add(
+                    arguments.get("minutes"),
+                    arguments.get("task_id"),
+                    arguments.get("start"),
+                    arguments.get("end"),
+                    arguments.get("remark", ""),
+                )
+            elif name == "focus_records":
+                value = client.focus_records(
+                    arguments.get("date"),
+                    arguments.get("start_date"),
+                    arguments.get("end_date"),
+                    arguments.get("page_size", 50),
+                )
+            elif name == "focus_delete":
+                value = client.focus_delete(arguments.get("id"))
             else:
                 raise KeyError(f"未知工具：{name}")
             result = _tool_result(value)
